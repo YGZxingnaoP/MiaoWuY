@@ -1,0 +1,13 @@
+1、在根目录打开cmd
+2、Modefile文件中更改模型存放的位置（system部分配置角色卡）
+3、输入：ollama create Qwen2.5-7B-Instruct -f Modelfile
+即可把模型加入文件
+
+记得下载量化模型
+终端运行：ollama pull qwen2.5:1.5b
+
+卸载：ollama rm Qwen-MiaoWu
+安装：ollama create Qwen-MiaoWu -f Modelfile
+试运：ollama run Qwen-MiaoWu
+查看system prompt : ollama show Qwen-MiaoWu --system
+建议：每次重启后重装模型

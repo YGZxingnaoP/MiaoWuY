@@ -1,0 +1,231 @@
+# 唱歌功能
+from func.tools.singleton_mode import singleton
+from func.log.default_log import DefaultLog
+from func.gobal.data import SingData
+from func.obs.obs_init import ObsInit
+from func.tools.string_util import StringUtil
+
+from func.tts.tts_core import TTsCore
+from func.llm.llm_core import LLmData
+from func.image.image_core import ImageCore
+
+from func.obs.obs_websocket import VideoControl
+from func.vtuber.emote_oper import EmoteOper
+from func.vtuber.action_oper import ActionOper
+from func.tts.player import MpvPlay
+
+import os
+import json
+import time
+from threading import Thread
+import glob
+
+@singleton
+class SingCore:
+    """
+    纯本地MP3唱歌点播核心：
+    - 歌曲文件格式为 MP3，存放于 ./output/歌曲名/ 目录下
+    - 优先查找 ./output/歌曲名/歌曲名.mp3，若不存在则查找该目录下第一个 .mp3 文件
+    - 播放时仅播放该 MP3 文件（不再分离伴奏/人声）
+    """
+    log = DefaultLog().getLogger()
+    singData = SingData()
+    llmData = LLmData()
+    ttsCore = TTsCore()
+    imageCore = ImageCore()
+    emoteOper = EmoteOper()
+    actionOper = ActionOper()
+    mpvPlay = MpvPlay()
+
+    def __init__(self):
+        self.obs = ObsInit().get_ws()
+
+    # -------------------- 对外唱歌入口 --------------------
+    def singTry(self, songname, username):
+        """异步处理单次点歌"""
+        try:
+            if songname:
+                self.sing(songname, username)
+        except Exception as e:
+            self.log.exception("【singTry】发生异常：")
+            self.singData.is_singing = 2
+
+    def sing(self, songname, username):
+        """
+        核心逻辑：
+        1. 检查本地是否存在 MP3 文件
+        2. 存在 → 加入播放队列
+        3. 不存在 → TTS 回复“不知道”
+        """
+        songname = songname.strip()
+        if not songname:
+            return
+
+        song_dir = f"./output/{songname}/"
+        # 检查重复点播（已在歌单或正在播放）
+        if self.exist_song_queues(self.singData.SongMenuList, songname):
+            self.ttsCore.tts_say(f"回复{username}：歌曲《{songname}》已经在歌单中了，请勿重复点播")
+            return
+
+        # 查找 MP3 文件
+        mp3_path = self._find_mp3_file(song_dir, songname)
+        if mp3_path:
+            self.log.info(f"找到本地歌曲 MP3: {mp3_path}")
+            self.ttsCore.tts_say(f"回复{username}：好的，播放《{songname}》")
+            # 加入播放队列（携带 MP3 文件路径）
+            self.singData.SongMenuList.put({
+                "username": username,
+                "songname": songname,
+                "mp3_path": mp3_path,
+                "query": songname   # 用于搜图等
+            })
+        else:
+            self.log.info(f"本地不存在歌曲: {song_dir} 下的 MP3 文件")
+            self.ttsCore.tts_say(f"回复{username}：不知道《{songname}》这首歌曲")
+
+    # -------------------- 播放歌曲 --------------------
+    def play_song(self, songname, mp3_path, username, query):
+        """播放单个 MP3 文件"""
+        try:
+            self.log.info(f"准备唱歌《{songname}》, MP3路径: {mp3_path}")
+
+            # 触发搜图（使用歌曲名作为关键词）
+            img_search_json = {"prompt": query, "username": username}
+            Thread(target=self.imageCore.searchimg_output, args=(img_search_json,)).start()
+
+            # 虚拟主播表情/动作
+            self.emoteOper.emote_ws(1, 0.2, "唱歌")
+            self.ttsCore.tts_say(f"回复{username}：我准备唱一首歌《{songname}》")
+            Thread(target=self.actionOper.auto_swing).start()
+
+            # 播放 MP3 文件（使用 mpv，沿用原播放器方法）
+            Thread(target=self.sing_play,
+                   args=("mpv.exe", mp3_path, 70, "0")).start()
+
+            # 等待播放结束标志
+            time.sleep(3)
+            while self.singData.sing_play_flag == 1:
+                time.sleep(1)
+
+            # 停止伴奏（原 OBS 控制，此处可根据需要保留或移除）
+            # self.obs.control_video("伴奏", VideoControl.STOP.value)
+            self.emoteOper.emote_ws(1, 0.2, "唱歌")  # 恢复默认表情
+            return 1
+        except Exception as e:
+            self.log.exception(f"《{songname}》play_song异常：")
+            return 3
+
+    def sing_play(self, mpv_name, song_path, volume, start):
+        """实际调用 mpv 播放"""
+        self.singData.sing_play_flag = 1
+        self.mpvPlay.mpv_play(mpv_name, song_path, volume, start)
+        self.singData.sing_play_flag = 0
+
+    # -------------------- 队列轮询 --------------------
+    def check_playSongMenuList(self):
+        """播放队列轮询（串行播放）"""
+        if not self.singData.SongMenuList.empty() and self.singData.is_singing == 2:
+            self.singData.play_song_lock.acquire()
+            mlist = self.singData.SongMenuList.get()
+            self.singData.SongNowName = mlist
+            self.singData.is_singing = 1
+
+            # 暂停 OBS 背景音乐（如有）
+            self.obs.control_video("背景音乐", VideoControl.PAUSE.value)
+
+            # 播放歌曲
+            self.play_song(mlist["songname"], mlist["mp3_path"],
+                           mlist["username"], mlist["query"])
+
+            # 队列空则恢复背景音乐
+            if self.singData.SongMenuList.qsize() == 0:
+                self.obs.control_video("背景音乐", VideoControl.PLAY.value)
+
+            self.singData.is_singing = 2
+            self.singData.SongNowName = {}
+            self.singData.play_song_lock.release()
+
+    def check_sing(self):
+        """点歌请求队列轮询（异步处理）"""
+        if not self.singData.SongQueueList.empty():
+            song_json = self.singData.SongQueueList.get()
+            self.log.info(f"启动唱歌: {song_json}")
+            Thread(target=self.singTry,
+                   args=(song_json["prompt"], song_json["username"])).start()
+
+    # -------------------- HTTP 接口（可选）--------------------
+    def http_sing(self, songname, username):
+        """HTTP 点歌接口"""
+        self.log.info(f'HTTP唱歌接口处理："{username}"点播歌曲《{songname}》')
+        self.singData.SongQueueList.put({"prompt": songname, "username": username})
+
+    def http_songlist(self, _):
+        """返回当前歌单（供前端调试）"""
+        jsonstr = []
+        if self.singData.SongNowName:
+            username = self.singData.SongNowName["username"]
+            songname = self.singData.SongNowName["songname"]
+            jsonstr.append({"songname": f"'{username}'点播《{songname}》"})
+        for i in range(self.singData.SongMenuList.qsize()):
+            data = self.singData.SongMenuList.queue[i]
+            username = data["username"]
+            songname = data["songname"]
+            jsonstr.append({"songname": f"'{username}'点播《{songname}》"})
+        return f'({"status": "成功","content": {json.dumps(jsonstr)}})'
+
+    # -------------------- 消息处理 --------------------
+    def msg_deal(self, traceid, query, uid, user_name):
+        """
+        识别唱歌指令：
+        - 命中“唱一下/唱一首/唱歌/点歌/点播” → 提取歌曲名，放入队列，返回 True
+        - 否则 → 返回 False（上层统一回复“不知道”）
+        """
+        keywords = ["唱一下", "唱一首", "唱歌", "点歌", "点播"]
+        matched = StringUtil.has_string_reg_list(f"^{keywords}", query)
+        if matched is not None:
+            idx = StringUtil.is_index_contain_string(keywords, query)
+            song_query = query[idx:].strip()
+            if song_query:
+                self.log.info(f"[{traceid}] 唱歌提示: {song_query}")
+                self.singData.SongQueueList.put({
+                    "traceid": traceid,
+                    "prompt": song_query,
+                    "username": user_name
+                })
+                return True
+        return False
+
+    # -------------------- 工具方法 --------------------
+    def exist_song_queues(self, queues, name):
+        """检查歌曲是否已在播放队列或正在播放"""
+        # 当前播放
+        if "songname" in self.singData.SongNowName and \
+           self.singData.SongNowName["songname"] == name:
+            return True
+        # 待播队列
+        for i in range(queues.qsize()):
+            if queues.queue[i]["songname"] == name:
+                return True
+        return False
+
+    def _find_mp3_file(self, song_dir, songname):
+        """
+        查找歌曲目录下的 MP3 文件：
+        1. 优先返回 ./output/歌曲名/歌曲名.mp3
+        2. 若不存在，则返回该目录下第一个 .mp3 文件
+        3. 若无任何 .mp3 文件，返回 None
+        """
+        if not os.path.isdir(song_dir):
+            return None
+
+        # 优先：精确匹配歌曲名.mp3
+        exact_path = os.path.join(song_dir, f"{songname}.mp3")
+        if os.path.isfile(exact_path):
+            return exact_path
+
+        # 其次：查找目录下任意 .mp3 文件
+        mp3_files = glob.glob(os.path.join(song_dir, "*.mp3"))
+        if mp3_files:
+            return mp3_files[0]  # 取第一个
+
+        return None
