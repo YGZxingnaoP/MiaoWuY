@@ -1,3 +1,4 @@
+# ================== tts_core.py ==================
 # tts语音合成
 import uuid
 import logging
@@ -72,6 +73,12 @@ class TTsCore:
         # 顺序控制结构
         self.pending_lock = Lock()
         self.pending_segments = {}   # traceid -> 状态字典
+
+        # ====== 新增：暂停标志 ======
+        self.paused = False
+        self.pause_lock = Lock()
+        # ====== 新增：防止重复生成“喵喵喵”的简单标志 ======
+        self._meow_generating = False
 
         # 启动播放线程
         self.play_thread = Thread(target=self._play_worker, daemon=True)
@@ -153,35 +160,95 @@ class TTsCore:
                 self.proxy_process.kill()
             self.proxy_process = None
 
+    # ====== 新增：暂停/恢复方法 ======
+    def pause(self):
+        with self.pause_lock:
+            if self.paused:
+                return
+            self.paused = True
+            self.log.info("TTS 暂停：停止所有语音合成与播放")
+
+            # 清空播放队列和字幕队列
+            while not self.play_queue.empty():
+                try:
+                    self.play_queue.get_nowait()
+                except:
+                    pass
+            while not self.subtitle_queue.empty():
+                try:
+                    self.subtitle_queue.get_nowait()
+                except:
+                    pass
+
+            # 清空待处理分段
+            with self.pending_lock:
+                self.pending_segments.clear()
+
+            # 注意：无法取消已在线程池中运行的任务，但那些任务会在 tts_say_do 开头检查 paused 并提前返回
+
+    def resume(self):
+        with self.pause_lock:
+            if not self.paused:
+                return
+            self.paused = False
+            self.log.info("TTS 恢复")
+
+    # ====== 新增：生成“喵喵喵”语音（在播放线程超时时调用）======
+    def _generate_meow(self):
+        if self._meow_generating:
+            return  # 避免短时间内重复生成
+        self._meow_generating = True
+        try:
+            self.log.info("生成“喵喵喵”语音")
+            # 直接调用 tts_say，但需要确保不会在 paused 状态下生成
+            # 这里我们绕过暂停检查，因为超时发生时应播放喵喵喵
+            # 但为了安全，临时恢复 paused 状态？
+            with self.pause_lock:
+                was_paused = self.paused
+                self.paused = False  # 临时允许合成
+            try:
+                self.tts_say("喵喵喵")
+            finally:
+                with self.pause_lock:
+                    self.paused = was_paused
+        finally:
+            self._meow_generating = False
+
     def _play_worker(self):
-        """顺序播放音频文件的线程，带可配置的复读机制"""
+        """顺序播放音频文件的线程，带可配置的复读机制，修改超时行为"""
         last_played = None  # 存储上一个播放的文件路径及标记 (file_path, is_last)
         while True:
+            # 检查暂停标志
+            with self.pause_lock:
+                if self.paused:
+                    time.sleep(0.1)
+                    continue
+
             if last_played is not None:
                 # 处于等待复读状态，尝试获取新文件
                 try:
                     file_path, is_last = self.play_queue.get(timeout=self.repeat_timeout)
                 except queue.Empty:
-                    # 超时，执行复读（如果启用）
+                    # 超时，根据需求取消复读，插入“喵喵喵”
                     if self.repeat_enabled:
-                        self.log.info(f"{self.repeat_timeout}秒内无新语音，复读: {last_played[0]}")
+                        self.log.info(f"{self.repeat_timeout}秒内无新语音，取消复读，插入“喵喵喵”")
+                        # 删除等待复读的文件
                         try:
-                            self.mpvPlay.mpv_play("mpv.exe", last_played[0], 100, "0")
-                        except Exception as e:
-                            self.log.exception(f"复读播放失败: {last_played[0]}")
-                        finally:
-                            try:
-                                os.remove(last_played[0])
-                            except:
-                                pass
+                            os.remove(last_played[0])
+                        except:
+                            pass
+                        last_played = None
+                        # 异步生成“喵喵喵”并放入播放队列
+                        Thread(target=self._generate_meow, daemon=True).start()
+                        continue  # 重新进入循环，等待新文件
                     else:
                         # 复读禁用，直接删除等待的文件
                         try:
                             os.remove(last_played[0])
                         except:
                             pass
-                    last_played = None
-                    continue
+                        last_played = None
+                        continue
                 else:
                     # 有新文件，删除等待复读的文件
                     try:
@@ -189,11 +256,21 @@ class TTsCore:
                     except:
                         pass
                     last_played = None
-                    self.log.info(f"开始播放: {file_path}")
+                    #self.log.info(f"开始播放: {file_path}")
             else:
                 # 正常等待新文件
                 file_path, is_last = self.play_queue.get()
-                self.log.info(f"开始播放: {file_path}")
+                #self.log.info(f"开始播放: {file_path}")
+
+            # 播放前再次检查暂停（防止在等待过程中暂停）
+            with self.pause_lock:
+                if self.paused:
+                    # 如果暂停，不播放，直接删除文件
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+                    continue
 
             # 播放新文件
             try:
@@ -230,6 +307,10 @@ class TTsCore:
         """顺序处理字幕的线程"""
         while True:
             reply_json = self.subtitle_queue.get()
+            # 暂停时不处理字幕（但字幕队列已被清空，此处不会阻塞）
+            with self.pause_lock:
+                if self.paused:
+                    continue
             self.ttsData.ReplyTextList.put(reply_json)
             self.log.info(reply_json)
 
@@ -291,6 +372,12 @@ class TTsCore:
 
     # 直接合成语音播放 {"question":question,"text":text,"lanuage":"ja"}
     def tts_say_do(self,json):
+
+        # ====== 新增：暂停检查 ======
+        with self.pause_lock:
+            if self.paused:
+                self.log.info("TTS 已暂停，取消合成")
+                return
 
         # 提取字段（包括可选的 seg_index/total_segments）
         seg_index = json.get("seg_index", 0)
@@ -405,6 +492,10 @@ class TTsCore:
     )
     # 如果语音已经放完且队列中还有回复 则创建一个生成并播放TTS的线程
     def check_tts(self):
+        # ====== 新增：暂停时不处理新任务 ======
+        with self.pause_lock:
+            if self.paused:
+                return
         if not self.llmData.AnswerList.empty():
             json = self.llmData.AnswerList.get()
             traceid = json["traceid"]

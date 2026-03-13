@@ -75,40 +75,42 @@ class Mem0Manager:
 
     def add_user_message(self, message: str, username: str):
         """记录用户消息，等待 assistant 回复"""
-        self.pending_user_message = message
-        self.pending_username = username
+        with self.lock:
+            self.pending_user_message = message
+            self.pending_username = username
 
     def add_assistant_message(self, message: str):
-        if not hasattr(self, 'pending_user_message') or self.pending_user_message is None:
-            raise RuntimeError("没有待处理的用户消息，请先调用 add_user_message")
-        
-        username = self.pending_username
-        round_data = {
-            "user": self.pending_user_message,
-            "assistant": message,
-            "username": username,
-        }
-        # 1. 加入当前用户的短期记忆列表（用于构建最近几轮上下文）
         with self.lock:
-            self.pending_dialogues.append(round_data)
+            if not hasattr(self, 'pending_user_message') or self.pending_user_message is None:
+                raise RuntimeError("没有待处理的用户消息，请先调用 add_user_message")
+        
+            username = self.pending_username
+            round_data = {
+                "user": self.pending_user_message,
+                "assistant": message,
+                "username": username,
+            }
+            # 1. 加入当前用户的短期记忆列表（用于构建最近几轮上下文）
+            with self.lock:
+                self.pending_dialogues.append(round_data)
 
-        # 2. 加入全局队列（附带用户ID）
-        global_round = {
-            "user_id": self.uid,
-            "username": username,
-            "user": self.pending_user_message,
-            "assistant": message,
-        }
-        with self.__class__._global_lock:
-            self.__class__._global_pending_dialogues.append(global_round)
-            # 检查全局队列长度是否达到阈值
-            if len(self.__class__._global_pending_dialogues) >= self.__class__._GLOBAL_MAX_PENDING:
-                # 取出前 max-1 轮用于总结，保留最后一轮继续积累
-                to_summarize = self.__class__._global_pending_dialogues[:-1]
-                self.__class__._global_pending_dialogues = [self.__class__._global_pending_dialogues[-1]]
-                if self.summary_generator and to_summarize:
-                    threading.Thread(target=self._generate_and_save_global_summary,
-                                     args=(to_summarize,)).start()
+            # 2. 加入全局队列（附带用户ID）
+            global_round = {
+                "user_id": self.uid,
+                "username": username,
+                "user": self.pending_user_message,
+                "assistant": message,
+            }
+            with self.__class__._global_lock:
+                self.__class__._global_pending_dialogues.append(global_round)
+                # 检查全局队列长度是否达到阈值
+                if len(self.__class__._global_pending_dialogues) >= self.__class__._GLOBAL_MAX_PENDING:
+                    # 取出前 max-1 轮用于总结，保留最后一轮继续积累
+                    to_summarize = self.__class__._global_pending_dialogues[:-1]
+                    self.__class__._global_pending_dialogues = [self.__class__._global_pending_dialogues[-1]]
+                    if self.summary_generator and to_summarize:
+                        threading.Thread(target=self._generate_and_save_global_summary,
+                                         args=(to_summarize,)).start()
 
         # 3. 注释掉原有的用户独立触发总结的代码（否则会同时触发两种总结）
         # if len(self.pending_dialogues) >= self.max_pending_rounds:

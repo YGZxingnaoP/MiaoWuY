@@ -1,37 +1,22 @@
 import asyncio
 import threading
 import json
-import time
 import pyaudio
 import websockets
 import numpy as np
 import collections
 import webrtcvad
+import time
 from typing import Optional, Callable
 
 from func.log.default_log import DefaultLog
 from func.config.default_config import defaultConfig
-from func.speaker.speaker_verification import SpeakerVerification
+
 
 class FunASRCore:
-    """
-    FunASR 实时语音识别客户端（持续监听模式）
-    1. 连接 WebSocket 服务器
-    2. 捕获麦克风音频并发送（静音时也发送数据，保持连接）
-    3. 接收识别结果，最终结果通过回调或 HTTP 发送给 AI 核心
-    """
-
     def __init__(self, callback: Optional[Callable[[str, str, str], None]] = None):
         self.log = DefaultLog().getLogger()
         full_config = defaultConfig().get_config()
-        # 以下两个属性保留（变量名不改变），但不再用于匹配逻辑
-        self.segment_counter = 0
-        self.segment_futures = {}
-
-        # 存放完整句子音频的队列
-        self.segment_audio_queue = asyncio.Queue()
-
-        # 读取 FunASR 配置
         self.funasr_config = full_config.get('funasr', {})
         self.enabled = self.funasr_config.get('enabled', False)
         if not self.enabled:
@@ -42,18 +27,14 @@ class FunASRCore:
         self.hotwords = self.funasr_config.get('hotwords', [])
         self.username = self.funasr_config.get('username', '访客')
         self.uid = self.funasr_config.get('uid', 'funasr_user')
-        self.silence_seconds = self.funasr_config.get('silence_seconds', 3)
         self.energy_threshold = self.funasr_config.get('energy_threshold', 500)
-        self.send_blocks = self.funasr_config.get('send_blocks', 17)
-        # 读取省电模式配置（带默认值）
         self.power_save_enabled = self.funasr_config.get('power_save_enabled', False)
         self.power_save_silence_seconds = self.funasr_config.get('power_save_silence_seconds', 30)
         self.power_save_check_interval = self.funasr_config.get('power_save_check_interval', 0.5)
-        #vad能量阈值判断
         self.vad_energy_threshold = self.funasr_config.get('vad_energy_threshold', 500)
 
         # 音频参数
-        self.CHUNK = 960                     # 60ms @16kHz (实际为30ms，960字节 = 480样本)
+        self.CHUNK = 960
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
         self.RATE = 16000
@@ -61,42 +42,26 @@ class FunASRCore:
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
-
-        # 外部回调函数
         self.callback = callback
 
-        # AI 核心接口地址
+        # AI 核心接口
         from func.gobal.data import CommonData
         self.commonData = CommonData()
         self.api_base = f"http://127.0.0.1:{self.commonData.port}"
 
-        # 读取声纹配置
-        sv_config = full_config.get('speaker_verification', {})
-        self.sv_enabled = sv_config.get('enabled', False)
-        if self.sv_enabled:
-            sv_threshold = sv_config.get('similarity_threshold', 0.7)
-            sv_embeddings_path = sv_config.get('embeddings_path', 'speaker_embeddings.npz')
-            self.speaker_verifier = SpeakerVerification(
-                embeddings_path=sv_embeddings_path,
-                threshold=sv_threshold
-            )
-            self.log.info("声纹识别模块已初始化")
-        else:
-            self.speaker_verifier = None
+        # 创建独立的 VAD 实例
+        self.vad = webrtcvad.Vad(1)
 
-        # 当前识别到的说话人（线程共享，使用锁保护）
-        self.current_speaker_uid = self.uid
-        self.current_speaker_username = self.username
-        self.speaker_lock = asyncio.Lock()
-
-        # 保留原有变量名（但实际状态由内部局部变量管理）
-        self.speech_accumulated = bytearray()
-        self.in_speech = False
-        self.speech_start_frame = 0
-        self.silent_frames = 0
+        # 队列：存放待处理的完整句子音频（按顺序）
+        self.segment_audio_queue = asyncio.Queue()
+        # 心跳间隔（秒）
+        self.heartbeat_interval = 30
+        # ====== 新增：句子合并延迟发送 ======
+        self.merge_timeout = 2  # 等待合并的时间（秒）
+        self.pending_tasks = {}  # 说话人 -> asyncio.Task
+        self.pending_texts = {}  # 说话人 -> 累积文本
 
     def start(self):
-        """启动后台识别线程"""
         if not self.enabled:
             self.log.info("FunASR 未启用")
             return
@@ -109,8 +74,13 @@ class FunASRCore:
         self.log.info("FunASR 识别线程已启动")
 
     def stop(self):
-        """停止识别线程"""
         self.running = False
+        # 取消所有待发送任务
+        for task in self.pending_tasks.values():
+            task.cancel()
+        self.pending_tasks.clear()
+        self.pending_texts.clear()
+
         if self.loop and self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
         if self.thread:
@@ -131,7 +101,7 @@ class FunASRCore:
     async def _main(self):
         while self.running:
             try:
-                async with websockets.connect(self.server_url) as ws:
+                async with websockets.connect(self.server_url, subprotocols=["binary"]) as ws:
                     self.log.info(f"已连接到 FunASR 服务器 {self.server_url}")
                     await self._send_config(ws)
                     send_task = asyncio.create_task(self._audio_sender(ws))
@@ -173,14 +143,6 @@ class FunASRCore:
         self.log.debug(f"发送启动配置: {config}")
 
     async def _audio_sender(self, ws):
-        """
-        从麦克风读取音频，实现新的句子切分与提交逻辑：
-        - 状态机：空闲(IDLE) -> 句子中(IN_SENTENCE) -> 挂起(HANGOVER) -> 提交/返回句子中
-        - 静音持续1秒触发进入HANGOVER，再持续1秒静音则提交句子
-        - HANGOVER期间若检测到语音，回到IN_SENTENCE继续累积
-        - 提高VAD灵敏度（模式1）
-        - 新增省电模式：长时间无语音时关闭音频流，定期检测唤醒
-        """
         p = pyaudio.PyAudio()
         stream = None
         try:
@@ -191,241 +153,75 @@ class FunASRCore:
                 input=True,
                 frames_per_buffer=self.CHUNK
             )
-            self.log.info("麦克风已打开，开始持续发送音频流")
+            self.log.info("麦克风已打开，开始发送音频流")
 
-            # 帧率计算（每帧30ms）
-            frame_duration = self.CHUNK / (self.RATE * 2)  # 16位2字节，样本数=CHUNK/2，时长=样本数/16000
-            frames_per_second = int(1 / frame_duration)    # 约33帧/秒
-            # 1秒对应的帧数（取整确保至少1秒）
-            one_sec_frames = int(0.5 / frame_duration) + 1  # 例如34帧，实际约1.02秒
+            frame_duration = self.CHUNK / (self.RATE * 2)  # 30ms
+            idle_silence_frames = int(self.power_save_silence_seconds / frame_duration) if self.power_save_enabled else float('inf')
+            idle_send_interval = int(1.0 / frame_duration)
 
-            # 句子有效所需的最小语音帧数（1秒）
-            min_speech_frames = one_sec_frames
-            # 句子内静音触发hangover的阈值（1秒）
-            silent_frames_threshold = one_sec_frames
-            # hangover状态下静音提交阈值（1秒）
-            hangover_threshold = one_sec_frames
-
-            # 环形缓冲区，存储最近1秒的帧（留余量）
-            buffer_maxlen = one_sec_frames + 5
-            audio_buffer = collections.deque(maxlen=buffer_maxlen)
-            flag_buffer = collections.deque(maxlen=buffer_maxlen)
-
-            # 状态变量
-            idle_silent_frames = 0          # 空闲态连续静音帧数（用于清空队列和省电）
-            consecutive_speech = 0           # 空闲态连续语音帧数（用于触发句子开始）
-
-            in_sentence = False              # 是否在句子中
-            in_hangover = False               # 是否在挂起等待中
-            sentence_audio = bytearray()      # 当前累积的句子音频
-            sentence_speech_frames = 0        # 句子中语音帧数
-            sentence_silent_frames = 0        # 句子内连续静音帧数
-            hangover_silent_frames = 0        # hangover内连续静音帧数
-
-            # 额外缓冲区，处理音频读取可能返回非整帧
-            leftover = b''
-
-            # 清空队列的静音阈值（5秒）
-            clear_silence_frames = int(5.0 / frame_duration)
-
-            # 如果启用了声纹，适当提高VAD灵敏度（模式1：略敏感）
-            if self.speaker_verifier and hasattr(self.speaker_verifier, 'vad') and hasattr(self.speaker_verifier.vad, 'set_mode'):
-                try:
-                    self.speaker_verifier.vad.set_mode(1)
-                    self.log.debug("VAD模式已设置为1（略敏感）")
-                except Exception as e:
-                    self.log.warning(f"设置VAD模式失败: {e}，使用默认模式")
-
-            # ========== 新增省电模式相关变量 ==========
-            power_save_mode = False
-            if self.power_save_enabled:
-                power_save_frames = int(self.power_save_silence_seconds / frame_duration)
-            else:
-                power_save_frames = float('inf')  # 永不进入
-            # =======================================
+            idle_mode = False
+            consecutive_silent = 0
+            frame_counter = 0
+            last_send_time = time.time()  # 记录上次发送时间
 
             while self.running:
-                if power_save_mode:
-                    # ========== 省电模式：周期性检测声音 ==========
-                    await asyncio.sleep(self.power_save_check_interval)
-                    try:
-                        # 临时打开音频流检测
-                        p_temp = pyaudio.PyAudio()
-                        stream_temp = p_temp.open(
-                            format=self.FORMAT,
-                            channels=self.CHANNELS,
-                            rate=self.RATE,
-                            input=True,
-                            frames_per_buffer=self.CHUNK,
-                            start=False
-                        )
-                        stream_temp.start_stream()
-                        # 读取一小段音频（例如0.2秒），确保整帧数
-                        read_frames = int(0.2 * self.RATE / self.CHUNK) * self.CHUNK
-                        data = stream_temp.read(read_frames, exception_on_overflow=False)
-                        stream_temp.stop_stream()
-                        stream_temp.close()
-                        p_temp.terminate()
-
-                        # 简单能量检测（或使用VAD）
-                        audio_array = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-                        energy = np.sqrt(np.mean(audio_array ** 2))
-                        if energy > self.energy_threshold:  # 能量超过阈值视为有声音
-                            self.log.info("检测到声音，退出省电模式")
-                            power_save_mode = False
-                            # 重新初始化 PyAudio 和流
-                            p = pyaudio.PyAudio()
-                            stream = p.open(
-                                format=self.FORMAT,
-                                channels=self.CHANNELS,
-                                rate=self.RATE,
-                                input=True,
-                                frames_per_buffer=self.CHUNK
-                            )
-                            # 重置状态变量，避免误触发
-                            idle_silent_frames = 0
-                            consecutive_speech = 0
-                            in_sentence = False
-                            in_hangover = False
-                            sentence_audio = bytearray()
-                            sentence_speech_frames = 0
-                            sentence_silent_frames = 0
-                            hangover_silent_frames = 0
-                            # 将检测到的音频数据作为剩余数据，避免丢失开头
-                            leftover = data
-                            continue
-                    except Exception as e:
-                        self.log.error(f"省电模式检测异常: {e}")
-                        # 出错后等待稍长，避免频繁报错
-                        await asyncio.sleep(1)
-                    # 继续下一次检测
+                # 心跳检查：如果距离上次发送超过心跳间隔，发送一帧静音
+                now = time.time()
+                if now - last_send_time >= self.heartbeat_interval:
+                    silent_frame = b'\x00' * (self.CHUNK * 2)  # 静音 PCM 数据
+                    await ws.send(silent_frame)
+                    self.log.debug("发送心跳帧")
+                    last_send_time = now
+                    # 跳过本次音频采集，避免心跳过于频繁
+                    await asyncio.sleep(0)
                     continue
 
-                # ========== 正常模式：从麦克风读取音频 ==========
-                # 确保累积到一整帧
-                while len(leftover) < self.CHUNK:
-                    try:
-                        chunk = stream.read(self.CHUNK, exception_on_overflow=False)
-                    except Exception as e:
-                        self.log.error(f"音频读取错误: {e}")
-                        chunk = b''
-                    if not chunk:
-                        await asyncio.sleep(0.01)
-                        continue
-                    leftover += chunk
-                data = leftover[:self.CHUNK]
-                leftover = leftover[self.CHUNK:]
+                try:
+                    data = stream.read(self.CHUNK, exception_on_overflow=False)
+                except Exception as e:
+                    self.log.error(f"音频读取错误: {e}")
+                    await asyncio.sleep(0.1)
+                    continue
 
-                # 发送给ASR
-                await ws.send(data)
-
-                # 计算能量（用于预过滤）
+                # 能量检测 + VAD
                 audio_array = np.frombuffer(data, dtype=np.int16).astype(np.float32)
                 energy = np.sqrt(np.mean(audio_array ** 2))
-
-                # 能量阈值判断：若能量低于设定值，直接视为静音
                 if energy < self.vad_energy_threshold:
                     is_speech = False
                 else:
-                    # VAD判断
                     try:
-                        is_speech = self.speaker_verifier.vad.is_speech(data, self.RATE) if self.speaker_verifier else False
-                    except webrtcvad.Error as e:
-                        self.log.warning(f"VAD异常: {e}，视为静音")
+                        is_speech = self.vad.is_speech(data, self.RATE)
+                    except Exception:
                         is_speech = False
 
-                # 更新环形缓冲区（用于回溯）
-                audio_buffer.append(data)
-                flag_buffer.append(is_speech)
-
-                # ========== 状态机处理 ==========
-                if in_hangover:
-                    # 挂起状态：等待确认是否真的结束
-                    sentence_audio.extend(data)          # 继续累积音频（包括静音）
-                    if is_speech:
-                        # 检测到新语音，回到句子中，合并
-                        self.log.debug("Hangover期间检测到语音，继续累积句子")
-                        in_hangover = False
-                        in_sentence = True
-                        sentence_silent_frames = 0
-                        hangover_silent_frames = 0
-                    else:
-                        hangover_silent_frames += 1
-                        if hangover_silent_frames >= hangover_threshold:
-                            # 确认结束，提交句子
-                            if sentence_speech_frames >= min_speech_frames:
-                                await self.segment_audio_queue.put(bytes(sentence_audio))
-                            # 重置所有状态
-                            in_hangover = False
-                            in_sentence = False
-                            sentence_audio = bytearray()
-                            sentence_speech_frames = 0
-                            sentence_silent_frames = 0
-                            hangover_silent_frames = 0
-                            # 空闲静音计数器保留（用于清空队列和省电）
-                    # 否则继续hangover
-
-                elif in_sentence:
-                    # 句子中：累积音频，监控静音长度
-                    sentence_audio.extend(data)
-                    if is_speech:
-                        sentence_speech_frames += 1
-                        sentence_silent_frames = 0
-                    else:
-                        sentence_silent_frames += 1
-
-                    # 检查是否达到静音阈值，触发进入hangover
-                    if sentence_silent_frames >= silent_frames_threshold:
-                        in_sentence = False
-                        in_hangover = True
-                        hangover_silent_frames = 0
-
+                if is_speech:
+                    consecutive_silent = 0
+                    if idle_mode:
+                        idle_mode = False
+                        self.log.info("检测到语音，退出空闲模式")
                 else:
-                    # 空闲状态：检测语音开始
-                    if is_speech:
-                        idle_silent_frames = 0
-                        consecutive_speech += 1
-                        if consecutive_speech >= 2:   # 连续2帧语音触发开始
-                            # 将缓冲区所有历史帧加入句子（回溯约1秒）
-                            for hist_frame, hist_flag in zip(audio_buffer, flag_buffer):
-                                sentence_audio.extend(hist_frame)
-                                if hist_flag:
-                                    sentence_speech_frames += 1
-                            in_sentence = True
-                            consecutive_speech = 0
-                            self.log.debug("检测到语音开始，进入句子状态")
-                    else:
-                        consecutive_speech = 0
-                        idle_silent_frames += 1
-                        # 空闲状态下长时间无语音，清空待处理队列（防止残留）
-                        if idle_silent_frames >= clear_silence_frames:
-                            cleared = 0
-                            while not self.segment_audio_queue.empty():
-                                try:
-                                    self.segment_audio_queue.get_nowait()
-                                    cleared += 1
-                                except asyncio.QueueEmpty:
-                                    break
-                            if cleared > 0:
-                                self.log.info(f"静音超5秒，清空队列，清除了 {cleared} 个待处理音频")
-                            idle_silent_frames = 0
+                    consecutive_silent += 1
 
-                # ========== 检查是否进入省电模式 ==========
-                if self.power_save_enabled and not in_sentence and not in_hangover:
-                    if idle_silent_frames >= power_save_frames:
-                        self.log.info(f"静音超过{self.power_save_silence_seconds}秒，进入省电模式")
-                        power_save_mode = True
-                        # 关闭当前音频流，释放资源
-                        if stream:
-                            stream.stop_stream()
-                            stream.close()
-                        p.terminate()
-                        stream = None
-                        p = None
-                        # 跳过后续休眠，直接进入下一轮循环（省电模式）
-                        continue
+                # 空闲模式判断
+                if not idle_mode and consecutive_silent >= idle_silence_frames:
+                    idle_mode = True
+                    self.log.info(f"静音超过 {self.power_save_silence_seconds} 秒，进入空闲模式")
+                    frame_counter = 0
 
-                # 让步，避免阻塞事件循环
+                # 决定是否发送数据
+                send_this_frame = False
+                if not idle_mode:
+                    send_this_frame = True
+                else:
+                    frame_counter += 1
+                    if frame_counter >= idle_send_interval:
+                        send_this_frame = True
+                        frame_counter = 0
+
+                if send_this_frame:
+                    await ws.send(data)
+                    last_send_time = time.time()
+
                 await asyncio.sleep(0)
 
         except Exception as e:
@@ -438,113 +234,77 @@ class FunASRCore:
                 p.terminate()
             self.log.info("音频捕获已停止")
 
-    # 保留原方法（变量名不变）
-    async def _identify_speaker_async(self, audio_bytes, segment_id):
-        pass
-
     async def _message_receiver(self, ws):
         async for message in ws:
             if isinstance(message, bytes):
                 continue
             try:
                 data = json.loads(message)
-                # 精简日志，只保留关键信息
                 text = data.get("text")
                 is_final = data.get("is_final", False)
                 mode = data.get("mode", "")
                 if text and text.strip() and ("offline" in mode or is_final):
                     self.log.info(f"识别到最终文本: {text}")
-                    # 无限等待对应的句子音频（确保严格对应）
-                    audio_bytes = await self.segment_audio_queue.get()
-
-                    loop = asyncio.get_running_loop()
-                    speaker_name, speaker_uid = await loop.run_in_executor(
-                        None, self._identify_speaker_sync, audio_bytes
-                    )
-
-                    await self._handle_result(text, speaker_name, speaker_uid)
-
+                    # 从消息中获取声纹信息
+                    spk_name = data.get("spk_name", "未知")
+                    spk_score = data.get("spk_score", 0.0)
+                    await self._handle_result(text, spk_name, self.uid, spk_score)
             except json.JSONDecodeError:
                 self.log.warning(f"收到非 JSON 消息: {message[:100]}")
 
-    def _trim_silence(self, audio_bytes, sample_rate=16000):
-        """
-        使用 VAD 切除音频首尾静音，返回只包含主要语音的片段。
-        若音频中无语音帧，返回空字节串。
-        """
-        if not self.speaker_verifier or not hasattr(self.speaker_verifier, 'vad'):
-            return audio_bytes  # 无法切除则返回原音频
-
-        vad = self.speaker_verifier.vad
-        frame_duration_ms = 30  # 与发送端保持一致
-        frame_size = int(sample_rate * frame_duration_ms / 1000) * 2  # 字节数（16bit）
-
-        # 分帧
-        frames = [audio_bytes[i:i+frame_size] for i in range(0, len(audio_bytes), frame_size)]
-        speech_flags = []
-        for frame in frames:
-            if len(frame) == frame_size:
-                try:
-                    is_speech = vad.is_speech(frame, sample_rate)
-                except Exception:
-                    is_speech = False
-            else:
-                is_speech = False
-            speech_flags.append(is_speech)
-
-        # 找到第一个和最后一个语音帧索引
-        speech_indices = [i for i, flag in enumerate(speech_flags) if flag]
-        if not speech_indices:
-            return b''
-
-        first = speech_indices[0]
-        last = speech_indices[-1]
-        start_byte = first * frame_size
-        end_byte = (last + 1) * frame_size
-        return audio_bytes[start_byte:end_byte]
-
-    def _identify_speaker_sync(self, audio_bytes):
-        if not self.speaker_verifier:
-            return "未知", "未知"
-        # 过滤过短音频（少于1秒）
-        if len(audio_bytes) < 32000:  # 1秒字节数
-            return "未知", "未知"
-        # 切除首尾静音
-        trimmed = self._trim_silence(audio_bytes)
-        if len(trimmed) < 8000:      
-            return "未知", "未知"
-        name, sim = self.speaker_verifier.identify_speaker(audio_bytes)
-        self.log.info(f"声纹识别结果: {name}, 相似度: {sim:.2f}")
-        if name != "未知":
-            return name, name
-        else:
-            return "未知", "未知"
-
-    async def _handle_result(self, text: str, speaker_name: str, speaker_uid: str):
+    async def _handle_result(self, text: str, speaker_name: str, speaker_uid: str, score: float):
         if not text.strip():
             return
 
-        if self.sv_enabled and speaker_name == "未知":
-            # 不输出日志，符合精简要求
+        # 仅处理目标说话人
+        if speaker_name != "YGZ醒脑片":
+            self.log.debug(f"忽略非目标说话人: {speaker_name}")
             return
 
+        # ====== 句子合并逻辑 ======
+        # 如果该说话人已有待发送任务，取消它并合并文本
+        if speaker_name in self.pending_tasks:
+            self.pending_tasks[speaker_name].cancel()
+            # 累积新文本（用空格连接）
+            self.pending_texts[speaker_name] = self.pending_texts.get(speaker_name, "") + " " + text
+        else:
+            # 首次出现，直接设置累积文本
+            self.pending_texts[speaker_name] = text
+
+        # 创建新的延迟发送任务
+        task = asyncio.create_task(self._delayed_send(speaker_name, speaker_uid))
+        self.pending_tasks[speaker_name] = task
+
+    async def _send_to_llm(self, text: str, speaker_name: str, speaker_uid: str):
+        """实际发送文本给大模型的逻辑（从原 _handle_result 提取）"""
         if self.callback:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.callback, text, speaker_uid, speaker_name)
         else:
             url = f"{self.api_base}/msg"
-            payload = {
-                "msg": text,
-                "uid": speaker_uid,
-                "username": speaker_name
-            }
+            payload = {"msg": text, "uid": speaker_uid, "username": speaker_name}
             try:
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload) as resp:
                         if resp.status == 200:
-                            self.log.info(f"已送入 AI 核心: {text[:30]}...")
+                            self.log.info(f"已送入 AI 核心: {text[:30]}... (说话人: {speaker_name})")
                         else:
                             self.log.error(f"发送失败: {resp.status}")
             except Exception as e:
                 self.log.error(f"HTTP 异常: {e}")
+
+    async def _delayed_send(self, speaker_name: str, speaker_uid: str):
+        """延迟发送任务：等待合并超时后发送累积文本"""
+        try:
+            await asyncio.sleep(self.merge_timeout)
+            text = self.pending_texts.pop(speaker_name, "").strip()
+            if text:
+                await self._send_to_llm(text, speaker_name, speaker_uid)
+        except asyncio.CancelledError:
+            # 任务被取消，清理累积文本
+            self.pending_texts.pop(speaker_name, None)
+            raise
+        finally:
+            # 无论成功或取消，都移除任务引用
+            self.pending_tasks.pop(speaker_name, None)
